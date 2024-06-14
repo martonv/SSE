@@ -1,0 +1,515 @@
+import shopify
+import json
+import csv
+from flask import Flask, request
+import gspread
+import threading
+import time
+import datetime
+from datetime import date
+import tempfile
+import sys
+path = '/home/martonSSE/mysite'
+if path not in sys.path:
+   sys.path.insert(0, path)
+
+#shopify parameters
+#REDACTED
+shopUrl = f"https://{apiKey}:{accessToken}@{shopName}.myshopify.com/admin"
+queryUrl = f"https://{shopName}.myshopify.com/admin/api/2024-04/graphql.json"
+queryHeader = {"Content-Type": "applications/graphql",
+               "X-Shopify-Access_Token": accessToken}
+
+#initialize gspread
+scopes = ['https://www.googleapis.com/auth/spreadsheets',
+          'https://www.googleapis.com/auth/drive']
+gc = gspread.service_account(filename=r'[REDACTED]', scopes=scopes)
+
+## CHANGE SHEET NAME HERE ##
+sheet = gc.open('inventoryTest')
+
+## CHANGE STARTER FILE HERE ##
+inventorySheet = sheet.worksheet("test")
+countSheet = sheet.worksheet("test2")
+idSheet = sheet.worksheet("idMatcher")
+
+#duplicate prevention
+checkSet = set()
+
+#creating global for checking new day
+todaysDate = datetime.datetime.now().day
+
+
+#flask initialization + flask in sep. thread
+#NOTHING UNDER HERE BUT FLASK DEF OR ERROR
+app = Flask(__name__)
+@app.route('/', methods=['POST'])
+
+
+#setup Flask instance for receiving data thru POST
+#run functions if order not already found in set()
+#unique orders are the only ones passed
+def manageFlask():
+    global checkSet
+    if request.method == 'POST':
+      data = json.dumps(request.json)
+      data = json.loads(data)
+
+      #write to file to investigate
+      with open('result.json', 'w') as outFile:
+          json.dump(request.json, outFile)
+
+      id = data["order_id"]
+      print("Order #: ", id)
+
+      #call subsequent functions here
+      if id not in checkSet:
+          processData(data)
+          checkSet.add(id)
+
+    else:
+        print("ORDER DENIED! - Duplicate")
+    return 'thx', 200
+
+
+def flask():
+    app.run(host='127.0.0.1', debug=True, use_reloader=False, port=4996)
+    return
+
+
+def deBundler(bundleSKU):
+    match bundleSKU:
+      # CLEANER/BRIGHTENER
+      case "512-08":
+          insertSKUs = ["502-08", "503-08"]
+      case "512-32":
+          insertSKUs = ["502-32", "503-32"]
+      case "512-01":
+          insertSKUs = ["502-01", "503-01"]
+      case "512-05":
+          insertSKUs = ["502-05", "503-05"]
+      # ECO/BRIGHTENER
+      case "511-08":
+          insertSKUs = ["501-08", "503-08"]
+      case "511-32":
+          insertSKUs = ["501-32", "503-32"]
+      case "511-01":
+          insertSKUs = ["501-01", "503-01"]
+      case "511-05":
+          insertSKUs = ["501-05", "503-05"]
+      # STRIPPER/BRIGHTENER
+      case "513-32":
+          insertSKUs = ["504-32", "503-32"]
+      case "513-01":
+          insertSKUs = ["504-01", "503-01"]
+      case "513-05":
+          insertSKUs = ["504-05", "503-05"]
+      # STRIPPER/BUTYL/BRIGHTENER
+      case "514-05":
+          insertSKUs = ["504-05", "503-05", "505-01"]
+      case "514-01":
+          insertSKUs = ["504-01", "503-01", "505-01"]
+      case "514-32":
+          insertSKUs = ["504-32", "503-32", "505-01"]
+      #REFILL SETS: BRUSHES/ROLLERS
+      case "800-06":
+          insertSKUs = ["800-04", "800-05"]
+    return insertSKUs
+
+
+#on order fulfillment, adds skuList and quantityList to shipped section on inventory sheet
+def addToSheet(skuList, quantityList):
+    sheetSKU = inventorySheet.col_values(1)
+    #sheetQTY = inventorySheet.col_values(6)
+
+    for i, sku in enumerate(skuList):
+        try:
+            matching = sheetSKU.index(sku)
+            #if empty, NoneType is returned + errors. So, check type
+            if type(inventorySheet.cell(matching+1, 6).value) is int:
+                currQuantity = int(inventorySheet.cell(matching+1, 6).value)
+            else:
+                currQuantity = 0
+
+            inventorySheet.update_cell(matching+1, 6, quantityList[i]+currQuantity)
+            print("Updated inventory sheet with ", skuList, quantityList)
+
+        except ValueError:
+            print("SKU not found in inventory system: ", sku)
+
+
+
+
+
+
+#breaks down data from POST, then syncs with google spreadsheet
+def processData(data):
+    global fivegal, onegal, oz32, oz08
+    skuList = []
+    quantityList = []
+    sizeList = []
+    fivegal = 0
+    onegal = 0
+    oz32 = 0
+    oz08 = 0
+    badSKUs = ["511", "512", "513", "514"]
+    items = data["line_items"]
+
+    for item in items:
+        lineSKU = item["sku"]
+        lineQuantity = item["quantity"]
+        lineProduct = item["variant_title"]
+        print(lineSKU)
+
+        if lineSKU == '':
+            print(lineProduct, " not found in Shopify SKU system!")
+
+        try:
+            idMatcher = openIDs()
+            lineID = idMatcher[lineSKU]
+        except KeyError:
+            print(f"SKU {lineSKU} not found in system!")
+
+        #bundles, creates list of item + quantity
+        #if not in badSKU list, still append single entity to sheet
+        if lineSKU.split('-')[0] in badSKUs:
+            newSKUs = deBundler(lineSKU)
+            for skus in newSKUs:
+                skuList.append(skus)
+                quantityList.append(lineQuantity)
+        else:
+            skuList.append(lineSKU)
+            quantityList.append(lineQuantity)
+            print("skuList: ", skuList)
+            print("quantityList: ", quantityList)
+
+    #BRUSHES/ROLLERS NEED TO BE MULTIPLIED BY QUANTITY * 12 OR 6
+    for index, skuVal in enumerate(skuList):
+      if skuVal == "800-04":
+          quantityList[index] *= 6
+      elif skuVal == "800-05":
+          quantityList[index] *= 12
+
+    #for making second sheet bucket counts, some skus may appear as bucket but aren't
+    for values in items:
+        values = values["sku"]
+        if values != '800-05' and values != '900-01' and values != '800-01':
+            sizeList.append(values.split('-')[1])
+
+    for i, vals in enumerate(sizeList):
+        #for citronella, reassigns to 32oz
+        #currently disabled, ask bam
+        #if vals == '700-08':
+        #   vals = '700-32'
+        # finder = vals.split('-')[1]
+        match vals:
+            case '01':
+                onegal += quantityList[i]
+                print("One gallon total updated w/: ", onegal)
+            case '08':
+                oz08 += quantityList[i]
+                print("8oz total updated w/: ", oz08)
+            case '32':
+                oz32 += quantityList[i]
+                print("32oz total updated w/: ", oz32)
+            case '05':
+                fivegal += quantityList[i]
+                print("Five gallon total updated w/: ", fivegal)
+
+    countList = [fivegal, onegal, oz32, oz08]
+    print(countList)
+
+    checkNewDay()
+    totalShipped(countList)
+    addToSheet(skuList, quantityList)
+
+
+#checks for new day, if so runs newDayShipCount (wipes current count) -- 6/11 EDIT: Doesn't have to do this because totalShipped() already checks for date; if not, runs nDSC()
+#checks for new day, if so runs producedToShopify()
+def checkNewDay():
+    global todaysDate
+
+    now = datetime.datetime.now().day
+
+    if todaysDate != now:
+        #newDayShipCount()
+        #updating Shopify
+        producedToShopify()
+        #updating sheets
+        syncQuantity()
+        todaysDate = datetime.datetime.now().day
+
+
+#graphql update shopify inventory in loop, use bulkoperation to reduce API limitations
+def producedToShopify():
+    #structure:
+    #scan sheet every day
+    #graphQL bulkoperation to shopify backend inventory system
+    #blank lists for storage
+    prodCol = []
+    skuCol = []
+
+    #get values from google sheet columns
+    prod = inventorySheet.col_values(5)[1:88]
+    sku = inventorySheet.col_values(1)[1:88]
+
+    #remove 'None' from prodCol/skuCol
+    for ind, data in enumerate(prod):
+        if data != '':
+            prodCol.append(int(data))
+            skuCol.append(sku[ind])
+
+    prodCol = [ -x for x in prodCol]
+
+    changes = gqlChanges(skuCol, prodCol)
+    updateInventory(changes)
+    return
+
+
+def gqlChanges(skuCol, prodCol):
+    input = {"input": {"reason": "received", "name": "available", "changes": []}}
+    stock = {"delta": 0, "inventoryItemId": "", "locationId": "gid://shopify/Location/90281443351"}
+    holder = []
+    idMatcher = openIDs()
+
+    for ind, rows in enumerate(prodCol):
+        changes = stock
+        changes["delta"] = rows
+        changes["inventoryItemId"] =  idMatcher[skuCol[ind]]
+        holder.append(changes)
+        #print("curr run:", holder)
+
+    input["input"]["changes"] = holder
+    #input = json.dumps(input)
+    print(input)
+    return input
+
+
+#graphQL POST request to shopify to change inventory level by inventory ID
+def updateInventory(input):
+    mutation = '''
+    mutation inventoryAdjustQuantities($input: InventoryAdjustQuantitiesInput!) {
+      inventoryAdjustQuantities(input: $input) {
+        userErrors {
+          field
+          message
+        }
+        inventoryAdjustmentGroup {
+          reason
+          referenceDocumentUri
+          changes {
+            name
+            delta
+          }
+        }
+      }
+    }
+'''
+    #print(mutation)
+    #print(inputVar)
+    #mutation = json.dumps(mutation)
+    #input = json.dumps(input)
+    data = shopify.GraphQL().execute(mutation, variables=input)
+    data = json.loads(data)
+    print(data)
+    return
+
+
+#legacy, just getting location id
+def locationQuery():
+    query = """
+{
+  products(first: 10) {
+    edges {
+      node {
+        id
+        title
+      }
+    }
+  }
+}
+"""
+    data = shopify.GraphQL().execute(query)
+    data = json.loads(data)
+    print(data)
+
+
+#creates new row in google sheet if called after midnight
+#this is for the second sheet
+#legacy because totalShipped already does this, only called by totalShipped if DNE
+def newDayShipCount():
+
+    #if time.date()
+    todayArr = str(date.today()).split('-')
+    today = todayArr[1] + '-' + todayArr[2] + '-' + todayArr[0][2:4]
+    countSheet.append_row([today, 0, 0, 0, 0], value_input_option='USER_ENTERED')
+    print("New stat sheet row appended to sheets.")
+
+
+#updates quantity, required inventory
+#at midnight, first quantity turns to updated inventory
+#then produced is wiped to 0
+#then shipped is wiped to 0
+#upd. quantity (currQuant - shipped + produced) updates via sheet math
+def syncQuantity():
+    updQuant = inventorySheet.range("G2:G88")
+    currQuant = inventorySheet.range("C2:C88")
+    prodQuant = inventorySheet.range("E2:E88")
+    shipQuant = inventorySheet.range("F2:F88")
+    for val in range(len(updQuant)):
+        currQuant[val].value = updQuant[val].value
+        prodQuant[val].value = 0
+        shipQuant[val].value = 0
+
+    inventorySheet.update_cells(currQuant)
+    print("Current quantity updated.")
+    inventorySheet.update_cells(shipQuant)
+    print("Ship quantity wiped.")
+    inventorySheet.update_cells(prodQuant)
+    print("Produced quantity wiped.")
+
+
+#update shipped with 5 gals, 1 gals, 32oz, 8oz
+def totalShipped(countList):
+    today = str(date.today()).split('-')
+    print(today) #bug fixing
+    today = today[1] + '-' + today[2] + '-' + today[0][2:4]
+
+    #search thru first column of dates to check if its today
+    dateList = countSheet.col_values(1)
+
+    #means its a new day so gen new stat line, wipe sheet + sync
+    if today not in dateList:
+        print("Generating new date row in count sheet...")
+        newDayShipCount()
+        dateList = countSheet.col_values(1)
+
+    #finding the index of the matched value (for date in stats sheet) and updating with countList
+    for i, val in enumerate(dateList):
+        if val == today:
+            locate = "B" + str(i+1) + ":" + "E" + str(i+1)
+            print(locate)
+            found = countSheet.range(locate)
+
+    for j, values in enumerate(found):
+        found[j].value = countList[j] + int(found[j].value)
+
+    countSheet.update_cells(found)
+
+
+#initializes shopify connection
+def connectShopify():
+    session = shopify.Session(shopUrl, apiVersion, accessToken)
+    shopify.ShopifyResource.activate_session(session)
+
+
+#closes shopify connection, kinda unneeded but whatever
+def closeShopify():
+    shopify.ShopifyResource.clear_session()
+
+
+#this gets inventory IDs and puts it into a sheet for referencing
+#legacy, only need again on new product update
+#run query first for first 250, then use end cursor id and first 250 to get remainder
+#statusQuery for first 250, secondQuery for second 250
+def getIDs():
+    statusQuery = '''
+    query {
+        inventoryItems(first: 250) {
+            edges {
+                cursor
+                node {
+                    id
+                    tracked
+                    sku
+                }
+            }
+        }
+    }
+    '''
+    secondQuery = '''
+    query ($numProducts: Int!, $cursor: String) {
+      inventoryItems(first: $numProducts, after: $cursor) {
+            edges {
+                cursor
+                node {
+                    id
+                    tracked
+                    sku
+                }
+            }
+        }
+    }
+    '''
+
+    varString = {
+      "numProducts": 250,
+      "cursor": "eyJsYXN0X2lkIjo0MzM3Njc0NDg5MDM5MSwibGFzdF92YWx1ZSI6IjQzMzc2NzQ0ODkwMzkxIn0="
+    }
+
+    data = shopify.GraphQL().execute(secondQuery, variables=varString)
+    data = json.loads(data)
+    print(data)
+    neededData = data['data']['inventoryItems']['edges']
+    #idCursor = data['data']['inventoryItems']['edges']['cursor']
+    with open('outputVM.csv', 'a', newline='', encoding="utf-8") as csvfile:
+      writer = csv.writer(csvfile)
+      #header = ['id', 'sku']
+      #writer.writerow(header)
+      store = []
+
+      for items in neededData:
+        id = items['node']['id']
+        sku = items['node']['sku']
+        store.append([id, sku])
+
+      #print(store)
+      writer.writerows(store)
+      #print(idCursor)
+
+
+#matches sku with inventoryItem ID
+def matchID(skuIN):
+    idMatcher = openIDs()
+    outID = idMatcher[skuIN]
+    return outID
+
+
+#opens ID csv and gets ID/SKU matching
+def openIDs():
+    idMatcher = {}
+
+    idsFromSheet = idSheet.col_values(1)
+    skusFromSheet = idSheet.col_values(2)
+
+    for ind, skuValues in enumerate(skusFromSheet):
+        idMatcher[skuValues] = idsFromSheet[ind]
+
+    print(idMatcher)
+
+    return idMatcher
+
+
+#old way to get ids:skus
+#     global idMatcher
+#     idMatcher = {}
+
+#     with open('output.csv', 'r', encoding='utf-8') as csvOpen:
+#         csvReader = csv.reader(csvOpen)
+
+#         #skip header
+#         heading = next(csvReader)
+
+#         #idMatcher{"sku":"id"}
+#         for row in csvReader:
+#             idMatcher[row[1]] = row[0]
+
+
+#driver
+if __name__ == "__main__":
+    shop = connectShopify()
+    #openIDs()
+    flaskThread = threading.Thread(target=flask)
+    flaskThread.start()
+
+
